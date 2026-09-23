@@ -82,6 +82,26 @@ static __always_inline __u32 get_tid_ns(struct task_struct* task) {
   return ns_tid;
 }
 
+// get_witness_tid returns this task's TID as visible from the witness PID
+// namespace. Unlike get_witness_pid it intentionally does not use the group
+// leader: every thread is a separate liveness member.
+static __always_inline __u32 get_witness_tid(struct task_struct* task) {
+    __u32 pid_ns_inum = get_pid_ns_inum(task);
+    if (pid_ns_inum == witness_pid_ns_inum) {
+        return get_tid_ns(task);
+    }
+
+    struct pid* tp = BPF_CORE_READ(task, thread_pid);
+    if (!tp) return 0;
+    unsigned int task_level = BPF_CORE_READ(tp, level);
+    __u32 key = 0;
+    __u32* wlevel_ptr = bpf_map_lookup_elem(&witness_pid_ns_level_map, &key);
+    if (!wlevel_ptr || *wlevel_ptr > task_level) return 0;
+    struct pid_namespace* witness_ns = BPF_CORE_READ(tp, numbers[*wlevel_ptr].ns);
+    if (!witness_ns || BPF_CORE_READ(witness_ns, ns.inum) != witness_pid_ns_inum) return 0;
+    return BPF_CORE_READ(tp, numbers[*wlevel_ptr].nr);
+}
+
 static __always_inline int is_witness_pid_ns_tid_allowed(__u32 tid) {
     struct witness_pid_ns_tid_key key = {
         .tid = tid,

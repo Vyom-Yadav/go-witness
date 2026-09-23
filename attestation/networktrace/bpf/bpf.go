@@ -172,6 +172,7 @@ func Load(cfg LoadConfig) (*State, error) {
 			"proxy_state_map":              connectObjs.ProxyStateMap,
 			"gate_map":                     connectObjs.GateMap,
 			"pending_execs":                connectObjs.PendingExecs,
+			"tracked_tasks":                connectObjs.TrackedTasks,
 			"witness_pid_ns_level_map":     connectObjs.WitnessPidNsLevelMap,
 		},
 	}
@@ -205,6 +206,7 @@ func Load(cfg LoadConfig) (*State, error) {
 			"proxy_state_map":              connectObjs.ProxyStateMap,
 			"gate_map":                     connectObjs.GateMap,
 			"pending_execs":                connectObjs.PendingExecs,
+			"tracked_tasks":                connectObjs.TrackedTasks,
 			"witness_pid_ns_level_map":     connectObjs.WitnessPidNsLevelMap,
 			"cgroup_allowlist":             connectObjs.CgroupAllowlist,
 			"comm_allowlist":               connectObjs.CommAllowlist,
@@ -248,6 +250,7 @@ func Load(cfg LoadConfig) (*State, error) {
 			GateMap:                  taskTrackerObjs.GateMap,
 			ProxyStateMap:            taskTrackerObjs.ProxyStateMap,
 			ControlMap:               taskTrackerObjs.ControlMap,
+			TrackedTasksMap:          taskTrackerObjs.TrackedTasks,
 			TrackedPidNsMap:          connectObjs.TrackedPidNsMap,
 			WitnessPidNsLevelMap:     taskTrackerObjs.WitnessPidNsLevelMap,
 			HostNetnsInum:            hostNetnsInum,
@@ -374,6 +377,9 @@ type Maps struct {
 	GateMap       *ebpf.Map
 	ProxyStateMap *ebpf.Map
 	ControlMap    *ebpf.Map
+
+	// Exact live-task membership for the single PreExec command tree.
+	TrackedTasksMap *ebpf.Map
 
 	// PID namespaces created by tracked processes.
 	TrackedPidNsMap *ebpf.Map

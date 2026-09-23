@@ -25,7 +25,11 @@ type task_trackerCommAllowlistKey struct {
 
 type task_trackerControlVal struct {
 	_               structs.HostLayout
-	TracingDisabled uint8
+	TracingDisabled uint64
+	LiveTasks       uint64
+	LifecycleStatus uint64
+	LifecycleError  uint64
+	TerminalTsNs    uint64
 }
 
 type task_trackerGateKey struct {
@@ -76,6 +80,12 @@ type task_trackerOrigDstValV6 struct {
 	PidNsInum  uint32
 	NetnsInum  uint32
 	Comm       [16]int8
+}
+
+type task_trackerPendingExecVal struct {
+	_          structs.HostLayout
+	NsTid      uint32
+	WitnessTid uint32
 }
 
 type task_trackerProxyStateKey struct {
@@ -186,6 +196,7 @@ type task_trackerMapSpecs struct {
 	PendingExecs             *ebpf.MapSpec `ebpf:"pending_execs"`
 	ProxyStateMap            *ebpf.MapSpec `ebpf:"proxy_state_map"`
 	TrackedPidNsMap          *ebpf.MapSpec `ebpf:"tracked_pid_ns_map"`
+	TrackedTasks             *ebpf.MapSpec `ebpf:"tracked_tasks"`
 	TupleToCookieMap         *ebpf.MapSpec `ebpf:"tuple_to_cookie_map"`
 	TupleToCookieMapV6       *ebpf.MapSpec `ebpf:"tuple_to_cookie_map_v6"`
 	WitnessPidNsLevelMap     *ebpf.MapSpec `ebpf:"witness_pid_ns_level_map"`
@@ -228,6 +239,7 @@ type task_trackerMaps struct {
 	PendingExecs             *ebpf.Map `ebpf:"pending_execs"`
 	ProxyStateMap            *ebpf.Map `ebpf:"proxy_state_map"`
 	TrackedPidNsMap          *ebpf.Map `ebpf:"tracked_pid_ns_map"`
+	TrackedTasks             *ebpf.Map `ebpf:"tracked_tasks"`
 	TupleToCookieMap         *ebpf.Map `ebpf:"tuple_to_cookie_map"`
 	TupleToCookieMapV6       *ebpf.Map `ebpf:"tuple_to_cookie_map_v6"`
 	WitnessPidNsLevelMap     *ebpf.Map `ebpf:"witness_pid_ns_level_map"`
@@ -245,6 +257,7 @@ func (m *task_trackerMaps) Close() error {
 		m.PendingExecs,
 		m.ProxyStateMap,
 		m.TrackedPidNsMap,
+		m.TrackedTasks,
 		m.TupleToCookieMap,
 		m.TupleToCookieMapV6,
 		m.WitnessPidNsLevelMap,

@@ -30,6 +30,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -1180,6 +1181,133 @@ func TestIntegrationUntrackedSibling(t *testing.T) {
 			server.wait()
 		})
 	}
+}
+
+func TestIntegrationDoubleForkDaemon(t *testing.T) {
+	skipIfNotRoot(t)
+	bin := compileCTest(t, "t8_double_fork_daemon")
+
+	for _, withTracing := range []bool{false, true} {
+		name := "hooks-only"
+		if withTracing {
+			name = "full-tracing"
+		}
+		t.Run(name, func(t *testing.T) {
+			const port = 19905
+			server := newTestTCPServer(t, port, []byte("PONG"))
+			defer server.wait()
+			config := types.Config{
+				ProxyPort:        testProxyPort + 24,
+				ProxyBindIPv4:    "127.0.0.1",
+				ObserveChildTree: true,
+				Payload:          types.PayloadConfig{RecordPayload: true},
+			}
+			networkAttestor := NewWithConfig(config)
+			cmd := newCmd(withTracing, []string{bin, strconv.Itoa(port)})
+			ctx, err := attestation.NewContext("double-fork-daemon", []attestation.Attestor{cmd, networkAttestor})
+			require.NoError(t, err)
+			require.NoError(t, ctx.RunAttestors())
+			assertNoAttestorErrors(t, ctx)
+			assert.True(t, findPayload(networkAttestor.NetworkTrace.Connections, "DAEMON"),
+				"daemonized descendant traffic should remain captured after both parents exit")
+		})
+	}
+}
+
+func TestIntegrationCommandStartFailure(t *testing.T) {
+	skipIfNotRoot(t)
+	config := types.DefaultConfig()
+	config.ProxyPort = testProxyPort + 25
+	networkAttestor := NewWithConfig(config)
+	cmd := commandrun.New(
+		commandrun.WithCommand([]string{"/definitely-not-a-witness-command"}),
+		commandrun.WithSilent(true),
+	)
+	ctx, err := attestation.NewContext("command-start-failure", []attestation.Attestor{cmd, networkAttestor})
+	require.NoError(t, err)
+	done := make(chan error, 1)
+	go func() { done <- ctx.RunAttestors() }()
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("networktrace hung after command startup failure")
+	}
+	require.True(t, networkAttestor.NetworkTrace.StartTime.IsZero())
+	require.True(t, networkAttestor.NetworkTrace.EndTime.IsZero())
+	require.Empty(t, networkAttestor.NetworkTrace.Connections)
+	var commandFailed bool
+	for _, completed := range ctx.CompletedAttestors() {
+		if completed.Attestor.Name() == commandrun.Name {
+			commandFailed = completed.Error != nil
+		}
+	}
+	require.True(t, commandFailed, "command-run should own the startup error")
+}
+
+func TestIntegrationEBPFBackendNetworkTrace(t *testing.T) {
+	skipIfNotRoot(t)
+	const port = 19906
+	server := newTestTCPServer(t, port, []byte("PONG"))
+	defer server.wait()
+	input := filepath.Join(t.TempDir(), "ebpf-network-input")
+	tracerFile := filepath.Join(t.TempDir(), "tracer-pid")
+	require.NoError(t, os.WriteFile(input, []byte("EBPF_NETWORK"), 0o600))
+
+	config := types.DefaultConfig()
+	config.ProxyPort = testProxyPort + 26
+	config.Payload.RecordPayload = true
+	networkAttestor := NewWithConfig(config)
+	script := fmt.Sprintf(`while read key value rest; do if [ "$key" = "TracerPid:" ]; then echo "$value" > %s; break; fi; done < /proc/self/status; cat %s | nc -w 1 127.0.0.1 %d`, tracerFile, input, port)
+	cmd := commandrun.New(
+		commandrun.WithCommand([]string{"sh", "-c", script}),
+		commandrun.WithSilent(true),
+		commandrun.WithTracing(true),
+		commandrun.WithTraceBackend(commandrun.TraceBackendEBPF),
+	)
+	ctx, err := attestation.NewContext("ebpf-backend-networktrace", []attestation.Attestor{cmd, networkAttestor})
+	require.NoError(t, err)
+	require.NoError(t, ctx.RunAttestors())
+	assertNoAttestorErrors(t, ctx)
+	tracerPID, err := os.ReadFile(tracerFile)
+	require.NoError(t, err)
+	assert.Equal(t, "0", strings.TrimSpace(string(tracerPID)))
+	assert.True(t, findPayload(networkAttestor.NetworkTrace.Connections, "EBPF_NETWORK"))
+	assert.NotEmpty(t, cmd.Processes)
+}
+
+func TestIntegrationSIGKILLWithSurvivingOrphan(t *testing.T) {
+	skipIfNotRoot(t)
+	const port = 19907
+	server := newTestTCPServer(t, port, []byte("PONG"))
+	defer server.wait()
+	pidFile := filepath.Join(t.TempDir(), "root.pid")
+	config := types.DefaultConfig()
+	config.ProxyPort = testProxyPort + 27
+	config.Payload.RecordPayload = true
+	networkAttestor := NewWithConfig(config)
+	script := fmt.Sprintf("(sleep 1; echo -n 'SURVIVOR' | nc -w 1 127.0.0.1 %d) & echo $$ > %s; exec sleep 100", port, pidFile)
+	cmd := newCmd(false, []string{"sh", "-c", script})
+	ctx, err := attestation.NewContext("sigkill-with-orphan", []attestation.Attestor{cmd, networkAttestor})
+	require.NoError(t, err)
+	go func() {
+		for range 50 {
+			time.Sleep(50 * time.Millisecond)
+			data, readErr := os.ReadFile(pidFile)
+			if readErr != nil {
+				continue
+			}
+			pid, convErr := strconv.Atoi(strings.TrimSpace(string(data)))
+			if convErr == nil {
+				_ = unix.Kill(pid, unix.SIGKILL)
+				return
+			}
+		}
+	}()
+	require.NoError(t, ctx.RunAttestors())
+	assert.True(t, findPayload(networkAttestor.NetworkTrace.Connections, "SURVIVOR"),
+		"surviving orphan should keep BPF lifecycle running after root SIGKILL")
+	assert.Equal(t, 137, cmd.ExitCode)
 }
 
 // newMultiConnTCPServer is like newTestTCPServer but accepts up to n

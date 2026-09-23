@@ -18,6 +18,7 @@ package networktrace
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"sync"
@@ -30,6 +31,7 @@ import (
 	"github.com/in-toto/go-witness/log"
 	"github.com/in-toto/go-witness/registry"
 	"github.com/invopop/jsonschema"
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -295,17 +297,9 @@ type Attestor struct {
 }
 
 func (n *Attestor) DeclareHooks(hooks *attestation.ExecuteHooks) error {
-	err := hooks.Declare(Name, attestation.StagePreExec)
-	if err != nil {
+	if err := hooks.Declare(Name, attestation.StagePreExec); err != nil {
 		return err
 	}
-	err = hooks.Declare(Name, attestation.StagePreExit)
-	if err != nil {
-		return err
-	}
-
-	// AttestationContext does not expose hooks through the API,
-	// the attestors which declare hooks can store them directly.
 	n.hooks = hooks
 	return nil
 }
@@ -439,11 +433,10 @@ func (n *Attestor) IsExperimental() bool {
 
 // proxyRuntime holds the runtime state for proxy coordination
 type proxyRuntime struct {
-	connChannel    chan types.Connection
-	collectorWg    sync.WaitGroup
-	shutdownSignal chan struct{}
-	proxyDone      chan struct{}
-	cancelProxy    context.CancelFunc
+	connChannel chan types.Connection
+	collectorWg sync.WaitGroup
+	proxyDone   chan struct{}
+	cancelProxy context.CancelFunc
 
 	bpfMaps     *bpf.Maps
 	injector    *proxy.NetnsInjector
@@ -489,8 +482,8 @@ func (n *Attestor) Attest(ctx *attestation.AttestationContext) error {
 	}
 	defer runtime.cancelProxy()
 
-	// Register execution hooks
-	if err := n.registerHooks(bpfMaps, runtime); err != nil {
+	// Register the PreExec callback after BPF and proxy setup.
+	if err := n.registerPreExecHook(bpfMaps, runtime); err != nil {
 		return err
 	}
 
@@ -533,11 +526,10 @@ func (n *Attestor) initBPF() (*bpf.Maps, func(), error) {
 // initProxies creates CA manager and starts the proxy infrastructure
 func (n *Attestor) initProxies(ctx *attestation.AttestationContext, bpfMaps *bpf.Maps) (*proxyRuntime, error) {
 	runtime := &proxyRuntime{
-		connChannel:    make(chan types.Connection, 100),
-		shutdownSignal: make(chan struct{}),
-		proxyDone:      make(chan struct{}),
-		bpfMaps:        bpfMaps,
-		failClosed:     make(chan struct{}),
+		connChannel: make(chan types.Connection, 100),
+		proxyDone:   make(chan struct{}),
+		bpfMaps:     bpfMaps,
+		failClosed:  make(chan struct{}),
 	}
 
 	// Start connection collector
@@ -734,70 +726,43 @@ func (n *Attestor) failClosedTeardown(runtime *proxyRuntime) {
 	}
 }
 
-// registerHooks sets up PreExec and PreExit hooks for command lifecycle
-func (n *Attestor) registerHooks(bpfMaps *bpf.Maps, runtime *proxyRuntime) error {
-	// PreExec: called when command starts, adds PID to BPF filter
-	r1, err := n.hooks.RegisterHook(attestation.StagePreExec, Name, func(pid int) error {
+// registerPreExecHook installs filters and exact liveness while the root is
+// ptrace-stopped, before any command user code can execute.
+func (n *Attestor) registerPreExecHook(bpfMaps *bpf.Maps, runtime *proxyRuntime) error {
+	ready, err := n.hooks.RegisterHook(attestation.StagePreExec, Name, func(pid int) error {
 		log.Debugf("[networktrace] PreExec hook triggered, tracking PID=%d", pid)
 		n.NetworkTrace.Config.ObservePIDs = append(n.NetworkTrace.Config.ObservePIDs, uint32(pid))
-		n.NetworkTrace.StartTime = time.Now()
-		err := bpfMaps.LoadUserConfig(n.NetworkTrace.Config)
-		if err != nil {
-			log.Errorf("[networktrace] failed to load user config: %v", err)
+		if err := bpfMaps.LoadUserConfig(n.NetworkTrace.Config); err != nil {
 			n.failClosedTeardown(runtime)
 			runtime.triggerFailClosed(fmt.Errorf("pre-exec setup failed: %w", err))
 			return err
 		}
-		// Enable tracing after config is loaded and proxy is ready
-		if err := bpfMaps.SetTracingDisabled(false); err != nil {
-			log.Errorf("[networktrace] failed to enable tracing: %v", err)
+
+		// Stamp before enabling so no concurrently matched external process can
+		// produce a connection timestamp earlier than the trace start.
+		n.NetworkTrace.StartTime = time.Now()
+		if err := bpfMaps.StartProcessTree(uint32(pid)); err != nil {
+			n.NetworkTrace.StartTime = time.Time{}
 			n.failClosedTeardown(runtime)
-			runtime.triggerFailClosed(fmt.Errorf("enable tracing failed: %w", err))
+			runtime.triggerFailClosed(fmt.Errorf("start process tree: %w", err))
 			return err
 		}
 		return nil
 	})
 	if err != nil {
-		log.Errorf("[networktrace] failed to register pre-exec hook: %v", err)
-		return err
+		return fmt.Errorf("register PreExec hook: %w", err)
 	}
-	close(r1)
-
-	// PreExit: called when command is about to exit (PTRACE_EVENT_EXIT).
-	// The process is still frozen by ptrace at this point and it hasn't closed
-	// its sockets yet. We must NOT block here, ptrace will only PtraceCont
-	// (letting the process actually exit and close sockets) after this hook
-	// returns. Blocking on proxy cleanup would deadlock because the proxy's
-	// io.Copy is waiting for EOF from the process's socket.
-	// Cleanup is still done irrespective of the process exiting
-	r2, err := n.hooks.RegisterHook(attestation.StagePreExit, Name, func(pid int) error {
-		log.Debugf("[networktrace] PreExit hook triggered, PID=%d", pid)
-		n.NetworkTrace.EndTime = time.Now()
-		close(runtime.shutdownSignal)
-		return nil
-	})
-	if err != nil {
-		log.Errorf("[networktrace] failed to register pre-exit hook: %v", err)
-		return err
-	}
-	close(r2)
-
+	close(ready)
 	return nil
 }
 
-// waitAndCleanup waits for shutdown signal and performs orderly cleanup
-func (n *Attestor) waitAndCleanup(ctx *attestation.AttestationContext, runtime *proxyRuntime) error {
-	// Wait for shutdown signal from PreExit hook, a fail-closed condition, or
-	// context cancellation.
-	select {
-	case <-runtime.shutdownSignal:
-	case <-runtime.failClosed:
-		log.Errorf("[networktrace] failing closed: %v", runtime.failClosedCause())
-		n.failClosedTeardown(runtime)
-	case <-ctx.Context().Done():
-	}
+const lifecyclePollInterval = 50 * time.Millisecond
 
-	// Cleanup sequence
+// waitAndCleanup waits for the traced command tree to end and tears down the
+// proxy infrastructure. BPF disables new admission synchronously at the
+// final task exit; userspace polling only drives cleanup latency.
+func (n *Attestor) waitAndCleanup(ctx *attestation.AttestationContext, runtime *proxyRuntime) error {
+	result := n.awaitShutdown(ctx, runtime)
 
 	runtime.cancelProxy()
 	runtime.gateWg.Wait()
@@ -814,13 +779,150 @@ func (n *Attestor) waitAndCleanup(ctx *attestation.AttestationContext, runtime *
 
 	n.NetworkTrace.Summary = types.ComputeSummary(n.NetworkTrace.Connections)
 	log.Debugf("[networktrace] attestation complete, collected %d connections", len(n.NetworkTrace.Connections))
+	return result
+}
 
+// awaitShutdown blocks until the command tree exits, fails, or the caller
+// cancels, and returns the shutdown outcome.
+func (n *Attestor) awaitShutdown(ctx *attestation.AttestationContext, runtime *proxyRuntime) error {
+	ticker := time.NewTicker(lifecyclePollInterval)
+	defer ticker.Stop()
+
+	// Nil-ing the channel arm after completion starts lifecycle polling.
+	preExecDone := n.hooks.StageDone(attestation.StagePreExec)
+	for {
+		select {
+		case <-preExecDone:
+			preExecDone = nil
+			if n.hooks.StageError(attestation.StagePreExec) != nil {
+				// Startup aborted before user code: the run ends here.
+				return n.shutdownOnPreExecAbort(runtime)
+			}
+		case <-ticker.C:
+			if preExecDone == nil {
+				if result, done := n.pollLifecycleOnce(runtime); done {
+					return result
+				}
+			}
+		case <-runtime.failClosed:
+			return n.shutdownOnFailClosed(runtime)
+		case <-ctx.Context().Done():
+			return n.shutdownOnCancel(ctx, runtime)
+		}
+	}
+}
+
+// shutdownOnPreExecAbort ends the run when PreExec could not complete. The
+// trace never started: only networktrace's own setup failure is its error;
+// command startup or another attestor's hook owns the failure otherwise.
+func (n *Attestor) shutdownOnPreExecAbort(runtime *proxyRuntime) error {
 	if cause := runtime.failClosedCause(); cause != nil {
+		n.failClosedTeardown(runtime)
 		return cause
 	}
+	n.NetworkTrace.StartTime = time.Time{}
+	n.NetworkTrace.EndTime = time.Time{}
+	return errors.Join(n.stopTracing(runtime), n.wakeFrozenTasks(runtime))
+}
 
-	if ctx.Context().Err() != nil {
-		return ctx.Context().Err()
+// pollLifecycleOnce reads the BPF lifecycle state and reports whether the
+// tree reached a terminal state, along with the shutdown outcome.
+func (n *Attestor) pollLifecycleOnce(runtime *proxyRuntime) (error, bool) {
+	state, err := n.readLifecycle(runtime.bpfMaps)
+	if err != nil {
+		n.failClosedTeardown(runtime)
+		return fmt.Errorf("poll process-tree lifecycle: %w", err), true
+	}
+	switch state.Status {
+	case bpf.LifecycleRunning, bpf.LifecycleTransitioning:
+		return nil, false
+	case bpf.LifecycleExited:
+		return n.shutdownOnTreeExit(runtime, state), true
+	case bpf.LifecycleFailed:
+		return n.shutdownOnLifecycleFailure(runtime, state), true
+	default:
+		n.failClosedTeardown(runtime)
+		return fmt.Errorf("invalid process-tree lifecycle status %d", state.Status), true
+	}
+}
+
+// shutdownOnTreeExit stops the run after every tracked task exited. Tracing
+// is already disabled in BPF; only frozen tasks must be woken.
+func (n *Attestor) shutdownOnTreeExit(runtime *proxyRuntime, state bpf.LifecycleState) error {
+	endTime, err := lifecycleWallTime(state.TerminalTsNs)
+	if err != nil {
+		n.failClosedTeardown(runtime)
+		return err
+	}
+	n.NetworkTrace.EndTime = endTime
+	return n.wakeFrozenTasks(runtime)
+}
+
+// shutdownOnLifecycleFailure ends the run on BPF bookkeeping corruption.
+func (n *Attestor) shutdownOnLifecycleFailure(runtime *proxyRuntime, state bpf.LifecycleState) error {
+	n.NetworkTrace.EndTime, _ = lifecycleWallTime(state.TerminalTsNs)
+	n.failClosedTeardown(runtime)
+	return fmt.Errorf("BPF process-tree lifecycle failed: %s", state.Error)
+}
+
+// shutdownOnFailClosed ends the run on an internal fault (proxy injection
+// failure, watchdog timeout, or networktrace's own setup error).
+func (n *Attestor) shutdownOnFailClosed(runtime *proxyRuntime) error {
+	cause := runtime.failClosedCause()
+	n.failClosedTeardown(runtime)
+	return cause
+}
+
+// shutdownOnCancel ends the run when the caller abandons it while tracked
+// tasks may still be alive. Tasks frozen by the netns gate are intentionally
+// left stopped: resuming them would let unmonitored code run once tracing is
+// off, and the caller that cancelled the run owns its processes. Only the
+// kill switch is flipped, so in-flight connects are not redirected into the
+// proxy that is shutting down.
+func (n *Attestor) shutdownOnCancel(ctx *attestation.AttestationContext, runtime *proxyRuntime) error {
+	if !n.NetworkTrace.StartTime.IsZero() {
+		n.NetworkTrace.EndTime = time.Now()
+	}
+	return errors.Join(ctx.Context().Err(), n.stopTracing(runtime))
+}
+
+func (n *Attestor) readLifecycle(m *bpf.Maps) (bpf.LifecycleState, error) {
+	for {
+		state, err := m.ReadLifecycleState()
+		if errors.Is(err, unix.EINTR) {
+			continue
+		}
+		return state, err
+	}
+}
+
+func lifecycleWallTime(terminalTsNs uint64) (time.Time, error) {
+	if terminalTsNs == 0 {
+		return time.Time{}, fmt.Errorf("lifecycle terminal timestamp is zero")
+	}
+	nowMono, err := bpf.GetMonotonicNs()
+	if err != nil {
+		return time.Time{}, fmt.Errorf("read monotonic clock: %w", err)
+	}
+	if nowMono < terminalTsNs {
+		return time.Time{}, fmt.Errorf("lifecycle terminal timestamp %d is after current monotonic time %d", terminalTsNs, nowMono)
+	}
+	return time.Now().Add(-time.Duration(nowMono-terminalTsNs) * time.Nanosecond), nil
+}
+
+// stopTracing prevents new gates and redirects.
+func (n *Attestor) stopTracing(runtime *proxyRuntime) error {
+	if err := runtime.bpfMaps.SetTracingDisabled(true); err != nil {
+		return fmt.Errorf("disable tracing: %w", err)
 	}
 	return nil
+}
+
+// wakeFrozenTasks SIGCONTs every task frozen by the netns gate so no process
+// is left stopped. Original-destination metadata stays intact until active
+// proxy handlers drain.
+func (n *Attestor) wakeFrozenTasks(runtime *proxyRuntime) error {
+	return runtime.bpfMaps.DrainGate(0, func(t bpf.FrozenTask) error {
+		return bpf.SendSIGCONT(t.HostTID)
+	})
 }

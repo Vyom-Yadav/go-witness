@@ -44,9 +44,19 @@ struct {
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 10240);
-    __type(key, __u32);   // Global Host TID
-    __type(value, __u32); // Namespace-aware TID
+    __type(key, __u32);  // Global host TID before exec identity swap
+    __type(value, struct pending_exec_val);
 } pending_execs SEC(".maps");
+
+// Exact live-task membership for the single PreExec command tree. Keys are
+// TIDs as visible from the witness PID namespace, so descendant PID namespaces
+// share one collision-free identity domain.
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 65536);
+    __type(key, __u32);
+    __type(value, __u8);
+} tracked_tasks SEC(".maps");
 
 // Per-namespace proxy readiness latch (userspace = sole writer, monotonic).
 struct {
@@ -64,7 +74,7 @@ struct {
     __type(value, struct gate_val);
 } gate_map SEC(".maps");
 
-// Single-element kill switch (userspace = sole writer).
+// Single-element kill switch and command-tree lifecycle state.
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 1);

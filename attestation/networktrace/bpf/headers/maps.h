@@ -68,9 +68,20 @@ struct gate_val {
     __u64 stop_ts_ns;   // bpf_ktime_get_ns() at the moment SIGSTOP was sent
 };
 
-// control_map: single-element array kill switch written only by userspace.
+// control_map: single-element kill switch and command-tree lifecycle state.
+// Userspace initializes it while the root is ptrace-stopped; BPF owns it while
+// RUNNING and synchronously disables tracing on the first terminal transition.
 struct control_val {
-    __u8 tracing_disabled;
+    __u64 tracing_disabled;
+    __u64 live_tasks;
+    __u64 lifecycle_status;
+    __u64 lifecycle_error;
+    __u64 terminal_ts_ns;
+};
+
+struct pending_exec_val {
+    __u32 ns_tid;
+    __u32 witness_tid;
 };
 
 struct comm_allowlist_key {

@@ -127,11 +127,59 @@ func (o *connectOrigDstValV6) ToConnectionMetadata(cookie uint64) *ConnectionMet
 	}
 }
 
-// Gate-protocol constants. These mirror the values in headers/common.h.
+// Gate and lifecycle constants mirror headers/common.h.
 const (
 	proxyNotReady uint8 = 0
 	proxyReady    uint8 = 1
 )
+
+type LifecycleStatus uint64
+
+const (
+	LifecycleNotStarted LifecycleStatus = iota
+	LifecycleRunning
+	LifecycleTransitioning
+	LifecycleExited
+	LifecycleFailed
+)
+
+type LifecycleError uint64
+
+const (
+	LifecycleErrorNone LifecycleError = iota
+	LifecycleErrorTaskIdentity
+	LifecycleErrorTaskInsert
+	LifecycleErrorExecMigration
+	LifecycleErrorCounterUnderflow
+	LifecycleErrorControlState
+)
+
+func (e LifecycleError) String() string {
+	switch e {
+	case LifecycleErrorNone:
+		return "none"
+	case LifecycleErrorTaskIdentity:
+		return "task identity unavailable"
+	case LifecycleErrorTaskInsert:
+		return "tracked task insertion failed"
+	case LifecycleErrorExecMigration:
+		return "exec identity migration failed"
+	case LifecycleErrorCounterUnderflow:
+		return "live task counter underflow"
+	case LifecycleErrorControlState:
+		return "invalid control state"
+	default:
+		return fmt.Sprintf("unknown lifecycle error %d", e)
+	}
+}
+
+type LifecycleState struct {
+	TracingDisabled bool
+	LiveTasks       uint64
+	Status          LifecycleStatus
+	Error           LifecycleError
+	TerminalTsNs    uint64
+}
 
 // FrozenTask describes a process that the namespace gate has SIGSTOP'd and that is
 // awaiting a SIGCONT once a proxy is ready for its namespace.
@@ -164,10 +212,12 @@ func (m *Maps) IsProxyReady(netnsInum uint32) bool {
 	return val == proxyReady
 }
 
-// SetTracingDisabled flips the global kill switch. Still records witness pid namespace level.
+// SetTracingDisabled writes terminal control state. It is only valid before a
+// tree starts or after teardown is irreversible; BPF exclusively owns the
+// complete value while LifecycleRunning.
 func (m *Maps) SetTracingDisabled(disabled bool) error {
-	var key uint32 // single-element ARRAY map, index 0
-	val := task_trackerControlVal{}
+	var key uint32
+	val := task_trackerControlVal{LifecycleStatus: uint64(LifecycleNotStarted)}
 	if disabled {
 		val.TracingDisabled = 1
 	}
@@ -175,6 +225,39 @@ func (m *Maps) SetTracingDisabled(disabled bool) error {
 		return fmt.Errorf("set control_map tracing_disabled=%v: %w", disabled, err)
 	}
 	return nil
+}
+
+// StartProcessTree seeds the single liveness root and atomically publishes a
+// running, enabled lifecycle while the root is ptrace-stopped.
+func (m *Maps) StartProcessTree(rootWitnessTID uint32) error {
+	if err := m.TrackedTasksMap.Update(&rootWitnessTID, new(uint8(1)), ebpf.UpdateNoExist); err != nil {
+		return fmt.Errorf("seed tracked task %d: %w", rootWitnessTID, err)
+	}
+	var key uint32
+	val := task_trackerControlVal{
+		LiveTasks:       1,
+		LifecycleStatus: uint64(LifecycleRunning),
+	}
+	if err := m.ControlMap.Put(&key, &val); err != nil {
+		_ = m.TrackedTasksMap.Delete(&rootWitnessTID)
+		return fmt.Errorf("start process tree %d: %w", rootWitnessTID, err)
+	}
+	return nil
+}
+
+func (m *Maps) ReadLifecycleState() (LifecycleState, error) {
+	var key uint32
+	var val task_trackerControlVal
+	if err := m.ControlMap.Lookup(&key, &val); err != nil {
+		return LifecycleState{}, fmt.Errorf("read control lifecycle: %w", err)
+	}
+	return LifecycleState{
+		TracingDisabled: val.TracingDisabled != 0,
+		LiveTasks:       val.LiveTasks,
+		Status:          LifecycleStatus(val.LifecycleStatus),
+		Error:           LifecycleError(val.LifecycleError),
+		TerminalTsNs:    val.TerminalTsNs,
+	}, nil
 }
 
 // DrainGate consumes every pending gate entry (optionally limited to a single
@@ -273,12 +356,15 @@ func (m *Maps) ClearInterceptionMaps() error {
 	clearMapWithName("proxy_state_map", m.ProxyStateMap)
 	clearMapWithName("tracked_pid_ns_map", m.TrackedPidNsMap)
 	clearMapWithName("witness_pid_ns_level_map", m.WitnessPidNsLevelMap)
+	clearMapWithName("tracked_tasks", m.TrackedTasksMap)
 	return errors.Join(errs...)
 }
 
-// clearMap deletes every key in a hash map. Keys are snapshotted first because
-// deleting during iteration is not safe.
+// clearMap empties a map. Hash-map keys are deleted; ARRAY entries cannot be
+// deleted, so they are overwritten with zero values instead. Keys are
+// snapshotted first because deleting during iteration is not safe.
 func clearMap(mp *ebpf.Map) error {
+	isArray := mp.Type() == ebpf.Array
 	var keys [][]byte
 	var key []byte
 	val := make([]byte, mp.ValueSize())
@@ -292,6 +378,12 @@ func clearMap(mp *ebpf.Map) error {
 		return err
 	}
 	for _, k := range keys {
+		if isArray {
+			if err := mp.Put(k, make([]byte, mp.ValueSize())); err != nil {
+				return err
+			}
+			continue
+		}
 		if err := mp.Delete(k); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
 			return err
 		}
