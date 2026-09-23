@@ -382,15 +382,26 @@ func TestIntegrationHangingConnectionTeardown(t *testing.T) {
 			require.NoError(t, err)
 			defer listener.Close()
 
+			// The server reads one byte, then hangs until the test finishes. The
+			// deferred conn.Close() keeps conn referenced for the goroutine's
+			// whole life: once Read returns, conn is otherwise unreachable, the
+			// runtime finalizer closes its fd, and because unread data is still
+			// buffered ('\n' of "X\n") the kernel sends RST. That tears the
+			// connection down before timeout(1) fires, the pipeline exits 0
+			// instead of 124, and the assertion flakes on GC timing.
+			hangUntil := make(chan struct{})
+			defer close(hangUntil)
 			go func() {
 				conn, err := listener.Accept()
 				if err != nil {
 					return
 				}
+				defer conn.Close()
+
 				buf := make([]byte, 1)
 				_, _ = conn.Read(buf)
 
-				time.Sleep(1 * time.Hour)
+				<-hangUntil
 			}()
 
 			config := types.Config{
@@ -426,8 +437,8 @@ func TestIntegrationHangingConnectionTeardown(t *testing.T) {
 				foundCmdError := false
 				for _, ca := range ctx.CompletedAttestors() {
 					if ca.Attestor.Name() == "command-run" {
-						require.Error(t, ca.Error, "Expected command-run attestor to fail due to SIGKILL")
-						assert.Contains(t, ca.Error.Error(), "exit status 124", "Expected attestor to fail due to SIGKILL")
+						require.Error(t, ca.Error, "Expected command-run attestor to fail because timeout terminated the command")
+						assert.Contains(t, ca.Error.Error(), "exit status 124", "Expected attestor to fail with timeout's exit status 124")
 						foundCmdError = true
 						break
 					}
